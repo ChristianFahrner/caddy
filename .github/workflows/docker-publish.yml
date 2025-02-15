@@ -1,0 +1,173 @@
+name: Docker
+
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+on:
+  workflow_dispatch:  # Allows manual trigger via GitHub UI
+  schedule:
+    - cron: '0 18 * * *'  # 18:00 UTC = 19:00 CET
+
+env:
+  # Use docker.io for Docker Hub if empty
+  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      # This is used to complete the identity challenge
+      # with sigstore/fulcio when running outside of PRs.
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check if base images have changed
+        id: check-base-images
+        run: |
+          BASE_IMAGE_BUILDER=$(docker manifest inspect caddy:builder-alpine | sha256sum)
+          BASE_IMAGE_ALPINE=$(docker manifest inspect caddy:alpine | sha256sum)
+
+          if [ -f .image-digests ]; then
+            if grep -q "$BASE_IMAGE_BUILDER" .image-digests && grep -q "$BASE_IMAGE_ALPINE" .image-digests; then
+              echo "Base images have not changed."
+              echo "BUILD_NEEDED=false" >> $GITHUB_ENV
+            else
+              echo "Base images changed."
+              echo "$BASE_IMAGE_BUILDER" > .image-digests
+              echo "$BASE_IMAGE_ALPINE" >> .image-digests
+              echo "BUILD_NEEDED=true" >> $GITHUB_ENV
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add .image-digests
+              git commit -m "Update base image digests [skip ci]"
+              git push
+            fi
+          else
+            echo "$BASE_IMAGE_BUILDER" > .image-digests
+            echo "$BASE_IMAGE_ALPINE" >> .image-digests
+            echo "BUILD_NEEDED=true" >> $GITHUB_ENV
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .image-digests
+            git commit -m "Add initial base image digests [skip ci]"
+            git push
+          fi
+
+      - name: Check if Caddy Cloudflare module changed
+        id: check-module
+        run: |
+          MODULE_COMMIT=$(git ls-remote https://github.com/caddy-dns/cloudflare.git HEAD | awk '{ print $1 }')
+          
+          if [ -f .module-commit ]; then
+            if grep -q "$MODULE_COMMIT" .module-commit; then
+              echo "Module has not changed."
+              echo "MODULE_CHANGED=false" >> $GITHUB_ENV
+            else
+              echo "Module changed."
+              echo "$MODULE_COMMIT" > .module-commit
+              echo "MODULE_CHANGED=true" >> $GITHUB_ENV
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add .module-commit
+              git commit -m "Update Caddy module commit [skip ci]"
+              git push
+            fi
+          else
+            echo "$MODULE_COMMIT" > .module-commit
+            echo "MODULE_CHANGED=true" >> $GITHUB_ENV
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .module-commit
+            git commit -m "Add initial Caddy module commit [skip ci]"
+            git push
+          fi
+
+      - name: Determine if build is needed
+        run: |
+          if [ "$BUILD_NEEDED" == "false" ] && [ "$MODULE_CHANGED" == "false" ]; then
+            echo "No changes detected in base images or module. Skipping build."
+            echo "SKIP_BUILD=true" >> $GITHUB_ENV
+          else
+            echo "Changes detected. Proceeding with the build."
+            echo "SKIP_BUILD=false" >> $GITHUB_ENV
+          fi
+
+      # Install the cosign tool except on PR
+      # https://github.com/sigstore/cosign-installer
+      - name: Install cosign
+        if: env.SKIP_BUILD != 'true'
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 #v3.5.0
+        with:
+          cosign-release: 'v2.2.4'
+
+      # Set up BuildKit Docker container builder to be able to build
+      # multi-platform images and export cache
+      # https://github.com/docker/setup-buildx-action
+      - name: Set up Docker Buildx
+        if: env.SKIP_BUILD != 'true'
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+
+      # Login against a Docker registry except on PR
+      # https://github.com/docker/login-action
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: env.SKIP_BUILD != 'true'
+        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Extract metadata (tags, labels) for Docker
+      # https://github.com/docker/metadata-action
+      - name: Extract Docker metadata
+        if: env.SKIP_BUILD != 'true'
+        id: meta
+        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=alpine-cloudflare
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+
+      # Build and push Docker image with Buildx (don't push on PR)
+      # https://github.com/docker/build-push-action
+      - name: Build and push Docker image
+        if: env.SKIP_BUILD != 'true'
+        id: build-and-push
+        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+        with:
+          context: .
+          pull: true  # Always pull the latest base images
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Sign the resulting Docker image digest except on PRs.
+      # This will only write to the public Rekor transparency log when the Docker
+      # repository is public to avoid leaking data.  If you would like to publish
+      # transparency data even for private images, pass --force to cosign below.
+      # https://github.com/sigstore/cosign
+      - name: Sign the published Docker image
+        if: env.SKIP_BUILD != 'true'
+        env:
+          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        # This step uses the identity token to provision an ephemeral certificate
+        # against the sigstore community Fulcio instance.
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
